@@ -6,9 +6,12 @@
 
 Порядок работы:
   1. Загрузка config.yaml и настройка журнала search.log.
-  2. Получение списка лотов из ГИС «Торги» (при недоступности — резервный
-     источник goszemli.ru, раздел 5 ТЗ).
-  3. Первичная фильтрация списка (раздел 7.1 ТЗ).
+  2. Сбор лотов со ВСЕХ настроенных источников (раздел 5 ТЗ): основной
+     ГИС «Торги» + резервные goszemli.ru и heveya.ru; результаты
+     объединяются и дедуплицируются, а не берутся только от первого
+     работающего источника.
+  3. Первичная фильтрация списка (раздел 7.1 ТЗ). Лоты резервных
+     источников уже пре-фильтрованы по региону ДО загрузки карточек.
   4. Проверка карточек лотов, документов, координат и рисков (разделы 7.2–7.3).
   5. Дедупликация записей между запусками (раздел 14 ТЗ).
   6. Формирование Excel-отчёта с листами «Подходящие», «Требуют проверки»,
@@ -18,6 +21,7 @@
 """
 
 import copy
+import re
 import sys
 from pathlib import Path
 
@@ -44,6 +48,28 @@ from src.utils import LotStateStore, iso_now, parse_iso_datetime, rand_delay  # 
 SHEET_FIT = "Подходящие"
 SHEET_REVIEW = "Требуют проверки"
 SHEET_REJECT = "Отклонённые"
+
+# Номер извещения ГИС «Торги» в идентификаторе лота резервных источников
+# («26000003290000000024-1-arenda-uchastka-…» → 26000003290000000024)
+NOTICE_IN_ID_RE = re.compile(r"(\d{18,})-\d")
+
+
+def _lot_identity_keys(lot: dict) -> set:
+    """Ключи дедупликации лота между источниками и запусками."""
+    keys = set()
+    lot_id = str(lot.get("id") or "")
+    keys.add("id:" + lot_id)
+    match = NOTICE_IN_ID_RE.match(lot_id)
+    if match:
+        keys.add("notice:" + match.group(1))
+    if lot.get("notification_number"):
+        keys.add("notice:" + str(lot["notification_number"]))
+    if lot.get("cadastral_number"):
+        keys.add("cadr:" + str(lot["cadastral_number"]))
+    if lot.get("card_url"):
+        keys.add("url:" + str(lot["card_url"]).split("?")[0])
+    return keys
+
 
 def _fetch_card(source_client, lot: dict, cfg: dict, logger) -> None:
     """Загружает карточку лота и (опционально) текст документов (раздел 7.2)."""
@@ -81,6 +107,55 @@ def _record_from_state(record: dict) -> dict:
     return lot
 
 
+def _collect_from_all_sources(cfg, logger):
+    """Сбор лотов со всех источников (раздел 5 ТЗ).
+
+    :return: (per_source — список (клиент, лоты), source_used — строка-описание)
+    """
+    source_clients = [get_search_source(cfg, logger)] + get_reserve_clients(cfg, logger)
+    per_source = []
+    for client in source_clients:
+        try:
+            lots = client.search_lots()
+            per_source.append((client, lots))
+            logger.info("Источник %s: получено лотов: %d", client.name, len(lots))
+        except SourceUnavailableError as exc:
+            logger.warning("Источник %s недоступен: %s — продолжаю с другими "
+                           "источниками", client.name, exc)
+        except Exception as exc:
+            logger.error("Непредвиденная ошибка источника %s: %s", client.name, exc)
+    return per_source
+
+
+def _merge_sources(per_source, logger):
+    """Объединяет лоты всех источников, исключая дубликаты.
+
+    Приоритет у основного источника (ГИС «Торги») — первые в списке.
+
+    :return: (raw_lots, lot_clients — {id лота: клиент-владелец},
+              source_used — строка «источник (N) + …»)
+    """
+    raw_lots = []
+    lot_clients = {}
+    seen_keys = set()
+    source_used_parts = []
+    for client, lots in per_source:
+        kept = 0
+        for lot in lots:
+            keys = _lot_identity_keys(lot)
+            if keys & seen_keys:
+                continue                      # дубликат из другого источника
+            seen_keys |= keys
+            raw_lots.append(lot)
+            lot_clients[lot["id"]] = client
+            kept += 1
+        source_used_parts.append(f"{client.name} ({kept})")
+        logger.info("Источник %s: лотов %d, уникальных после объединения: %d",
+                    client.name, len(lots), kept)
+    source_used = " + ".join(source_used_parts) if source_used_parts else "—"
+    return raw_lots, lot_clients, source_used
+
+
 def main() -> int:
     """Точка входа бота. Возвращает код завершения процесса."""
     cfg_path = None
@@ -100,45 +175,23 @@ def main() -> int:
     lot_filter = LotFilter(cfg, logger)
 
     # ------------------------------------------------------------------
-    # 1. Получение списка лотов (основной источник → резервные)
+    # 1. Сбор лотов со ВСЕХ источников и объединение (раздел 5 ТЗ)
     # ------------------------------------------------------------------
-    source = None
-    raw_lots = []
-    source_used = "—"
-    try:
-        source = get_search_source(cfg, logger)
-        raw_lots = source.search_lots()
-        source_used = source.name
-    except SourceUnavailableError as exc:
-        logger.error("Основной источник недоступен: %s", exc)
-        logger.info("Переключение на резервные источники (раздел 5 ТЗ)...")
-        for reserve in get_reserve_clients(cfg, logger):
-            try:
-                raw_lots = reserve.search_lots()
-                source = reserve
-                source_used = reserve.name
-                logger.info("Используется резервный источник: %s", reserve.name)
-                break
-            except SourceUnavailableError as reserve_exc:
-                logger.error("Резервный источник недоступен: %s", reserve_exc)
-    except Exception as exc:
-        errors += 1
-        logger.error("Непредвиденная ошибка при получении списка: %s", exc)
-
-    if source is None:
+    per_source = _collect_from_all_sources(cfg, logger)
+    if not per_source:
         logger.error("Все источники данных недоступны. Бот завершает работу.")
-        _log_summary(logger, stats_found=len(raw_lots), source_used="недоступны",
+        _log_summary(logger, found_count=0, source_used="недоступны",
                      errors=errors, report_path=None)
         return 1
 
+    raw_lots, lot_clients, source_used = _merge_sources(per_source, logger)
     found_count = len(raw_lots)
-    logger.info("Найдено лотов: %d (источник: %s)", found_count, source_used)
+    logger.info("Найдено лотов всего: %d (источники: %s)", found_count, source_used)
 
     # ------------------------------------------------------------------
     # 2. Первичная фильтрация списка (раздел 7.1 ТЗ)
     # ------------------------------------------------------------------
     candidates = []
-    primary_passed = 0
     for lot in raw_lots:
         try:
             if lot.get("source") == "torgi.gov.ru":
@@ -152,7 +205,8 @@ def main() -> int:
                     logger.info("Лот %s отклонён на первичной фильтрации: %s",
                                 lot["id"], "; ".join(reasons))
             else:
-                # резервный источник: статус и регион неизвестны до карточки
+                # резервный источник: регион подтверждён пре-фильтром каталога,
+                # статус и цена неизвестны до карточки — проверим после неё
                 candidates.append(lot)
         except Exception as exc:
             errors += 1
@@ -164,29 +218,48 @@ def main() -> int:
     primary_passed = len(candidates)
     logger.info("Прошли первичную фильтрацию: %d", primary_passed)
 
-    # Резервные кандидаты: сначала лоты с упоминанием пригородов Хабаровска
-    if source is not None and source.name.startswith("goszemli"):
-        max_details = int((cfg.get("sources") or {}).get("reserve_max_details", 40))
+    # Лимит карточек для резервных источников (после регионального
+    # пре-фильтра: тратим лимит только на лоты Хабаровского края)
+    reserve_max = int((cfg.get("sources") or {}).get("reserve_max_details", 30))
+    by_source = {}
+    for lot in candidates:
+        client = lot_clients.get(lot["id"])
+        if client is None:
+            continue
+        by_source.setdefault(client.name, (client, []))[1].append(lot)
+
+    card_candidates = []
+    for client_name, (client, lots_c) in by_source.items():
+        if client_name.startswith("ГИС Торги"):
+            card_candidates.extend(lots_c)     # основной источник без лимита
+            continue
 
         def reserve_sort_key(lot):
             hit = _contains_any(" ".join([lot.get("name", ""),
-                                          lot.get("description", "")]),
+                                          lot.get("description", ""),
+                                          str((lot.get("attrs") or {}).get(
+                                              "Регион (источник)", ""))]),
                                 cfg["location_keywords"])
             return (0 if hit else 1, 0 if lot.get("area_m2") else 1)
 
-        candidates.sort(key=reserve_sort_key)
-        if len(candidates) > max_details:
-            logger.info("Резервный источник: проверка карточек ограничена %d лотами "
-                        "(sources.reserve_max_details)", max_details)
-            candidates = candidates[:max_details]
+        lots_c.sort(key=reserve_sort_key)
+        if len(lots_c) > reserve_max:
+            logger.info("Резервный источник %s: проверка карточек ограничена "
+                        "%d лотами (sources.reserve_max_details)",
+                        client_name, reserve_max)
+            lots_c = lots_c[:reserve_max]
+        card_candidates.extend(lots_c)
 
     # ------------------------------------------------------------------
     # 3. Проверка карточек лотов (раздел 7.2 ТЗ)
     # ------------------------------------------------------------------
     cards_checked = 0
-    for lot in candidates:
+    for lot in card_candidates:
+        client = lot_clients.get(lot["id"])
+        if client is None:                     # теоретически невозможно
+            continue
         try:
-            _fetch_card(source, lot, cfg, logger)
+            _fetch_card(client, lot, cfg, logger)
             cards_checked += 1
 
             # резервный источник: теперь регион и статус известны

@@ -10,6 +10,7 @@ import re
 from src.normalizer import (clean_html, normalize_area, normalize_address,
                             normalize_cadastral, normalize_date,
                             normalize_lease_term)
+from src.utils import keyword_pattern, normalize_russian_text
 
 # Человекочитаемые названия статусов лота (справочник ГИС «Торги»)
 LOT_STATUS_NAMES = {
@@ -268,6 +269,157 @@ def merge_torgi_detail(lot: dict, detail: dict, file_base_url: str) -> dict:
                 if match:
                     lot["lease_term_years"] = float(match.group(1))
                     break
+    if lot["lease_term_years"] is None:
+        lot["lease_term_years"] = normalize_lease_term(lot["card_text"], lot["attrs"])
+    return lot
+
+
+# ---------------------------------------------------------------------------
+# Резервный источник heveya.ru
+# ---------------------------------------------------------------------------
+
+def _page_visible_text(html_text: str) -> str:
+    """Видимый текст страницы: теги заменяются на '|', лишние пробелы убраны."""
+    import re as _re
+
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html_text, "lxml")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        text = soup.get_text("|")
+    except Exception:
+        text = _re.sub(r"<script.*?</script>", " ", str(html_text), flags=_re.S)
+        text = _re.sub(r"<[^>]+>", "|", text)
+    text = _re.sub(r"[ \t\u00a0]+", " ", text)
+    return _re.sub(r"\s*\|\s*", "|", text).strip(" |")
+
+
+def _label_value(text: str, label: str, max_len: int = 220):
+    """Значение после подписи «Метка:» до следующей вертикальной черты."""
+    match = re.search(re.escape(label) + r"\s*:?\s*\|?\s*([^|]{1," + str(max_len) + r"})",
+                      text, re.I)
+    return match.group(1).strip(" ,;.") if match else None
+
+
+def parse_heveya_list_item(url: str, name: str) -> dict:
+    """Создаёт базовый лот из элемента каталога heveya.ru."""
+    lot_id = re.search(r"/lot/(\d+)", url)
+    lot = new_lot(f"heveya-{lot_id.group(1)}" if lot_id else url, "heveya.ru")
+    lot["name"] = clean_html(name)
+    lot["card_url"] = url
+    # площадь в названии («Земельный участок 939 кв.м, Хабаровский край»)
+    if lot["area_m2"] is None:
+        lot["area_m2"], lot["area_ha"] = normalize_area(None, None, name)
+    # регион — часть названия после последней запятой
+    region = name.rsplit(",", 1)[-1].strip() if "," in name else ""
+    if region and keyword_pattern("Хабаровск").search(normalize_russian_text(region)):
+        lot["attrs"]["Регион (источник)"] = region
+    return lot
+
+
+def merge_heveya_detail(lot: dict, html_text: str) -> dict:
+    """Разбирает страницу карточки heveya.ru и дополняет лот данными."""
+    lot["attrs"].setdefault("Источник", "heveya.ru (срез каталога)")
+
+    title = ""
+    match = re.search(r"<title>(.*?)</title>", html_text, re.S | re.I)
+    if match:
+        title = clean_html(match.group(1))
+    if title and not lot["name"]:
+        lot["name"] = title
+    if title:
+        # площадь из заголовка («Земельный участок 1200 кв.м, ...»)
+        if lot["area_m2"] is None:
+            lot["area_m2"], lot["area_ha"] = normalize_area(None, None, title)
+
+    text = _page_visible_text(html_text)
+
+    # ключевые поля карточки по подписям
+    for label, attr in (("Кадастровый номер", "Кадастровый номер (heveya)"),
+                        ("Кадастровый номер участка", "Кадастровый номер (heveya)")):
+        value = _label_value(text, label, 60)
+        if value:
+            lot["attrs"][attr] = value
+            if not lot["cadastral_number"]:
+                lot["cadastral_number"] = normalize_cadastral(value) or ""
+            break
+
+    vri = _label_value(text, "вид разрешенного использования", 180) or \
+        _label_value(text, "вид разрешённого использования", 180)
+    if vri and not lot["vri_text"]:
+        lot["vri_text"] = vri
+
+    category = _label_value(text, "Категория земель", 80)
+    if category:
+        lot["land_category"] = category
+
+    ownership = _label_value(text, "форма собственности", 120) or \
+        _label_value(text, "Форма торгов", 120)
+    if ownership:
+        lot["ownership"] = ownership
+
+    address = _label_value(text, "Адрес", 240) or _label_value(text, "Местоположение", 240)
+    if address:
+        lot["address"] = normalize_address(address)
+
+    price = _label_value(text, "Начальная цена", 120) or \
+        _label_value(text, "Арендная плата", 120)
+    if price:
+        lot["extra"]["heveya_price_raw"] = f"цена: {price}"
+
+    deadline_raw = None
+    match = re.search(r"окончания\s*(?:приема|приёма)\s*заявок\s*:?\s*\|?\s*([^|]{1,60})",
+                      text, re.I)
+    if match:
+        deadline_raw = match.group(1)
+    if deadline_raw:
+        match = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", deadline_raw)
+        if match:
+            from datetime import datetime
+            lot["deadline"] = datetime(int(match.group(3)), int(match.group(2)),
+                                       int(match.group(1)))
+
+    # описание лота (первый крупный текстовый блок)
+    description = _label_value(text, "Описание", 800)
+    if description:
+        lot["description"] = clean_html(description)[:1200]
+
+    # тип сделки: «аренда» или «продажа/выкуп»
+    deal_zone = " ".join([title, lot.get("description", ""), text[:4000]])
+    if re.search(r"аренд\w*", deal_zone, re.I):
+        lot["deal_type_text"] = "rent"
+        lot["attrs"]["Тип сделки"] = "Аренда"
+    elif re.search(r"прода\w*|выкуп\w*", deal_zone, re.I):
+        lot["deal_type_text"] = "sale"
+        lot["attrs"]["Тип сделки"] = "Продажа"
+
+    # статус торгов
+    if re.search(r"процедура\s*завершена|торги\s*завершены|отменен\w*", text, re.I):
+        lot["status_code"] = "FINISHED"
+        lot["status_name"] = "Процедура завершена"
+    else:
+        lot["status_code"] = "PUBLISHED"
+        lot["status_name"] = "Опубликован"
+
+    # ссылки на документы
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html_text, "lxml")
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            label = clean_html(a.get_text())
+            if (re.search(r"\.(pdf|docx?|xlsx?)", href, re.I)) and label:
+                lot["documents"].append({"name": label[:120], "url": href})
+    except Exception:
+        pass
+
+    lot["card_text"] = " ".join(filter(None, [
+        title, lot.get("description", ""), lot.get("address", ""),
+        lot.get("vri_text", ""), lot["land_category"],
+        lot["attrs"].get("Кадастровый номер (heveya)", ""),
+        lot["extra"].get("heveya_price_raw", ""), text[:6000],
+    ]))
     if lot["lease_term_years"] is None:
         lot["lease_term_years"] = normalize_lease_term(lot["card_text"], lot["attrs"])
     return lot

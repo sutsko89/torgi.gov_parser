@@ -54,6 +54,9 @@ DEFAULTS = {
         "timeout_seconds": 30,
         "page_size": 50,
         "max_pages": 40,
+        # резервный режим без проверки SSL-сертификата (см. src/ssl_utils.py);
+        # для полной безопасности установите сертификаты Минцифры с gu-st.ru
+        "ssl_fallback_insecure": True,
     },
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) torgi-land-bot/1.0",
     "geocoding": {
@@ -63,8 +66,13 @@ DEFAULTS = {
         "nominatim_user_agent": "torgi-land-bot/1.0",
         "nominatim_delay_seconds": 1.1,
     },
-    "sources": {"primary": "torgi", "reserve": ["goszemli"],
-                "reserve_max_details": 40},
+    "sources": {"primary": "torgi", "reserve": ["goszemli", "heveya"],
+                "goszemli_region_slug": "habarovskii-krai",
+                "heveya_max_catalog_pages": 6,
+                "reserve_max_details": 30},
+    # латинские ключи региона в адресах лотов резервных источников
+    # (goszemli.ru транслитерирует регион в slug: «…-habarovskii-krai»)
+    "region_slug_keywords": ["khabarovsk", "habarovsk"],
     "logging": {"level": "INFO"},
 }
 
