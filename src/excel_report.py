@@ -220,6 +220,9 @@ def _write_summary(wb: Workbook, stats: dict, report_path: Path):
     title.font = Font(bold=True, size=13, color="2F5496")
     ws.merge_cells("A1:B1")
 
+    max_rent = stats.get("max_rent_per_year")
+    price_text = (f"аренда ≤ {float(max_rent):,.0f} руб./год".replace(",", " ")
+                  if max_rent else "без ограничения по цене (снято — цена справочная)")
     rows = [
         ("Дата и время запуска", stats.get("run_started_at")),
         ("Источник данных", stats.get("source_used")),
@@ -233,9 +236,8 @@ def _write_summary(wb: Workbook, stats: dict, report_path: Path):
         ("Ошибок в ходе работы", stats.get("errors")),
         ("Файл отчёта", report_path.name),
         ("Пороговые критерии",
-         f"площадь ≥ {stats.get('min_area_m2')} м²; аренда ≤ "
-         f"{stats.get('max_rent_per_year')} руб./год; расстояние ≤ "
-         f"{stats.get('max_distance_km')} км от Хабаровска"),
+         f"площадь ≥ {stats.get('min_area_m2')} м²; арендная плата {price_text}; "
+         f"расстояние ≤ {stats.get('max_distance_km')} км от Хабаровска"),
     ]
     row_idx = 3
     for label, value in rows:

@@ -168,9 +168,11 @@ def main() -> int:
 
     run_started_at = iso_now()
     logger.info("=== Запуск бота поиска участков ИЖС (%s) ===", run_started_at)
-    logger.info("Регион: %s | Сделка: %s | Площадь от %s м² | Аренда до %s руб./год",
-                cfg["region"], cfg["deal_type"], cfg["min_area_m2"],
-                cfg["max_rent_per_year"])
+    max_rent = cfg.get("max_rent_per_year")
+    price_text = (f"Аренда до {float(max_rent):,.0f} руб./год".replace(",", " ")
+                  if max_rent else "Цена: без ограничения (снято по решению пользователя)")
+    logger.info("Регион: %s | Сделка: %s | Площадь от %s м² | %s",
+                cfg["region"], cfg["deal_type"], cfg["min_area_m2"], price_text)
 
     errors = 0
     store = LotStateStore()
@@ -382,5 +384,39 @@ def _log_summary(logger, found_count, primary_passed=0, cards_checked=0,
         logger.info("Отчёт сохранён: %s", report_path)
 
 
+def _emergency_write_traceback(tb_text: str) -> None:
+    """Аварийная запись полного стека ошибки в search.log напрямую.
+
+    Нужна, если критическая ошибка произошла до настройки журнала
+    (например, в load_config). Бот никогда не должен падать молча:
+    по стеку в журнале можно точно определить причину сбоя.
+    """
+    try:
+        with open(PROJECT_ROOT / "search.log", "a", encoding="utf-8") as fh:
+            fh.write(tb_text.rstrip() + "\n")
+    except OSError:
+        pass                                  # даже журнал недоступен — не важно
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    # Последний рубеж защиты: ЛЮБАЯ непредвиденная ошибка фиксируется
+    # (полный стек в search.log + понятное сообщение в консоли) — бот
+    # не завершается молча с «голым» traceback без диагностики.
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nОстановлено пользователем (Ctrl+C). Частичные результаты "
+              "сохранены в output/state_lots.json.")
+        sys.exit(130)
+    except SystemExit:
+        raise
+    except Exception:
+        import traceback
+        tb_text = traceback.format_exc()
+        print("\n=== КРИТИЧЕСКАЯ ОШИБКА — работа бота прервана ===", file=sys.stderr)
+        print(tb_text, file=sys.stderr)
+        _emergency_write_traceback(
+            "\n=== КРИТИЧЕСКАЯ ОШИБКА (весь запуск прерван) ===\n" + tb_text)
+        print("Полный стек ошибки записан в search.log в корне проекта.",
+              file=sys.stderr)
+        sys.exit(1)

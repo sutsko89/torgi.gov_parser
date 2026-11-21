@@ -25,8 +25,11 @@ DEFAULTS = {
     "status": "приём заявок",
     "lot_statuses": ["PUBLISHED", "APPLICATIONS_SUBMISSION"],
     "min_area_m2": 600,
-    "max_rent_per_year": 180000,
-    "max_rent_per_month": 15000,
+    # Ограничения по арендной плате сняты по решению пользователя (null —
+    # без ограничения). Чтобы вернуть порог, задайте число в config.yaml,
+    # например max_rent_per_year: 180000 — правка кода не требуется.
+    "max_rent_per_year": None,
+    "max_rent_per_month": None,
     "max_distance_km": 50,
     "center": {"lat": 48.4814, "lon": 135.0721},
     "vri_keywords": ["индивидуальное жилищное строительство", "ижс"],
