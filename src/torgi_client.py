@@ -146,6 +146,14 @@ class BaseClient:
                 last_error = exc
                 self.log.warning("%s: ошибка запроса (%s), попытка %d/%d",
                                  self.name, exc, attempt + 1, retries)
+            except Exception as exc:
+                # Непредвиденная ошибка кода (TypeError и т.п.) — повторять
+                # бессмысленно, она не «сетевая». Полный стек идёт в search.log,
+                # чтобы причину можно было определить по журналу.
+                self.log.exception("%s: непредвиденная ошибка запроса к %s",
+                                   self.name, url)
+                raise SourceUnavailableError(
+                    f"{self.name}: {type(exc).__name__}: {exc}") from exc
             attempt += 1
             if attempt < retries:
                 delay = 2 ** attempt + random.uniform(0.5, 1.5)

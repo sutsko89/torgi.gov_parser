@@ -51,25 +51,41 @@ def _load_pem_dir(context: ssl.SSLContext, directory: Path) -> int:
     return loaded
 
 
-def _add_windows_system_store(context: ssl.SSLContext) -> int:
+def _add_windows_system_store(context: ssl.SSLContext, logger=None) -> int:
     """Добавляет сертификаты системного хранилища Windows (только Windows).
 
     Помогает, когда пользователь установил сертификаты Минцифры в Windows.
     На других ОС возвращает 0 (ничего не делает).
+
+    ВАЖНО: любой сбой здесь не должен прерывать работу бота — это только
+    дополнительный источник сертификатов (см. раздел 11 ТЗ). Поэтому
+    перехватывается ЛЮБОЕ исключение (не только SSLError/OSError): например,
+    в некоторых сборках Python/антивирусных агентов ssl.enum_certificates
+    или ssl.DER_cert_to_PEM_cert могут вести себя нестандартно, и раньше
+    это падало с TypeError «a bytes-like object is required, not 'str'»
+    уже на первом запросе каждого источника.
     """
     if not hasattr(ssl, "enum_certificates"):
         return 0  # не Windows
     added = 0
     for store_name in ("CA", "ROOT"):
         try:
-            for flags, der_data, _enc_type in ssl.enum_certificates(store_name):
-                try:
-                    context.load_verify_locations(cadata=ssl.DER_cert_to_PEM_cert(der_data))
-                    added += 1
-                except (ssl.SSLError, OSError):
-                    continue
-        except (ssl.SSLError, OSError):
+            certificates = ssl.enum_certificates(store_name)
+        except Exception as exc:
+            if logger:
+                logger.warning("SSL: хранилище сертификатов Windows %s недоступно: %s",
+                               store_name, exc)
             continue
+        for item in certificates:
+            try:
+                der_data = item[0] if isinstance(item, tuple) else item
+                if not isinstance(der_data, (bytes, bytearray)):
+                    continue          # неожиданный формат — пропускаем элемент
+                context.load_verify_locations(
+                    cadata=ssl.DER_cert_to_PEM_cert(bytes(der_data)))
+                added += 1
+            except Exception:
+                continue
     return added
 
 
@@ -120,19 +136,32 @@ def build_ssl_context(logger=None, include_windows_store: bool = True):
     certifi + сертификаты Минцифры (каталог certs/, при отсутствии — загрузка)
     + системное хранилище Windows. При ошибке проверки сертификата
     BaseClient сам переключится на незащищённый режим (если разрешено).
+
+    Функция «отказобезопасная»: при ЛЮБОЙ непредвиденной ошибке построения
+    усиленного контекста возвращается стандартный контекст certifi (и бот
+    продолжает работу), а сбой фиксируется в журнале. Раньше сбой здесь
+    (например, TypeError в хранилище Windows) падал наружу и обрывал
+    ВСЕ источники данных на первом же запросе.
     """
-    context = ssl.create_default_context(cafile=certifi.where())
-    loaded = _load_pem_dir(context, CERTS_DIR)
-    if loaded == 0:
-        # каталога certs/ нет или он пуст — пробуем скачать сертификаты
-        downloaded = download_russian_certs(logger)
-        if downloaded:
-            loaded = _load_pem_dir(context, CERTS_DIR)
-    if logger:
-        logger.debug("SSL: загружено дополнительных сертификатов Минцифры: %d", loaded)
-    if include_windows_store:
-        _add_windows_system_store(context)
-    return context
+    try:
+        context = ssl.create_default_context(cafile=certifi.where())
+        loaded = _load_pem_dir(context, CERTS_DIR)
+        if loaded == 0:
+            # каталога certs/ нет или он пуст — пробуем скачать сертификаты
+            downloaded = download_russian_certs(logger)
+            if downloaded:
+                loaded = _load_pem_dir(context, CERTS_DIR)
+        if logger:
+            logger.debug("SSL: загружено дополнительных сертификатов Минцифры: %d", loaded)
+        if include_windows_store:
+            _add_windows_system_store(context, logger)
+        return context
+    except Exception as exc:
+        if logger:
+            logger.warning("SSL: усиленный контекст не построен (%s: %s) — "
+                           "использую стандартный набор certifi",
+                           type(exc).__name__, exc)
+        return ssl.create_default_context(cafile=certifi.where())
 
 
 def build_insecure_context():

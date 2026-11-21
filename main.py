@@ -123,7 +123,9 @@ def _collect_from_all_sources(cfg, logger):
             logger.warning("Источник %s недоступен: %s — продолжаю с другими "
                            "источниками", client.name, exc)
         except Exception as exc:
-            logger.error("Непредвиденная ошибка источника %s: %s", client.name, exc)
+            # logger.exception пишет ПОЛНЫЙ стек ошибки в search.log —
+            # по нему можно определить точное место сбоя, не воспроизводя его.
+            logger.exception("Непредвиденная ошибка источника %s: %s", client.name, exc)
     return per_source
 
 
